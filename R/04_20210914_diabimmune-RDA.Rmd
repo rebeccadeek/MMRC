@@ -1,0 +1,901 @@
+---
+title: "DIABIMMUNE Real Data Analysis"
+author: "Rebecca Deek"
+date: "9/14/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+
+# set up parallelization
+nCores = future::availableCores() - 1
+future::plan(future::multisession, workers = nCores)
+
+# source functions
+source(here::here("R/longitudinal/02a_20210511_twoStageMCEMFunction.R"))
+source(here::here("R/longitudinal/03a_20210726_MCLRTFunction.R"))
+
+# read data
+# df_tax = readr::read_tsv(paste0(path, "taxonomy.qza/data/taxonomy.tsv"))
+load(here::here("data/df_samples.RData"))
+load(here::here("data/df_subject.RData"))
+load(here::here("data/mat_otu_genus.RData"))
+
+# rename sample_name
+df_subject = df_subject %>% 
+  janitor::clean_names() %>% 
+  dplyr::rename(sampleid=sample_name)
+
+# rename #SampleID
+df_samples = df_samples %>% 
+  janitor::clean_names() %>% 
+  dplyr::rename(sampleid=number_sample_id) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::filter(., subjectid %in% unique(df_subject$subjectid))
+```
+
+
+# Clean data
+
+```{r clean-data}
+# sample x genus table
+mat_otu_genus_t = t(mat_otu_genus)
+
+# extra genus level classification from taxonomy
+genus.class = dplyr::pull(tibble::as_tibble(str_split_fixed(colnames(mat_otu_genus_t), "\\|", 6))[,6])
+
+# rename columns from taxonomy to genus
+colnames(mat_otu_genus_t) = genus.class
+
+# remove any counts unknown at the genus level
+mat_otu_genus_t = mat_otu_genus_t[,-which(colnames(mat_otu_genus_t)=="g__")] # not defined at g level
+mat_otu_genus_t = mat_otu_genus_t[,-which(stringr::str_detect(colnames(mat_otu_genus_t), pattern = "g__")==F)] # pre-g
+mat_otu_genus_t = mat_otu_genus_t[,-which(stringr::str_detect(colnames(mat_otu_genus_t), "\\d"))] # with number naming
+
+# clean colnames
+mat_otu_genus_t = mat_otu_genus_t %>% as.data.frame() %>% janitor::clean_names()
+# remove "g__" preface on all col names
+colnames(mat_otu_genus_t) = stringr::str_replace_all(colnames(mat_otu_genus_t), "g_", "")
+
+# find colnames with # --> repeat col
+rep.g = which(stringr::str_detect(colnames(mat_otu_genus_t), "\\d"))
+# remove numbering
+colnames(mat_otu_genus_t)[rep.g] = str_split_fixed(colnames(mat_otu_genus_t)[rep.g], "\\_", 2)[,1]
+# merge columns with the same name (repeats)
+# https://stackoverflow.com/questions/35626945/row-wise-sum-of-values-grouped-by-columns-with-same-name
+mat_otu_genus_t = as.data.frame(t(rowsum(t(mat_otu_genus_t), group = colnames(mat_otu_genus_t), na.rm = T)))
+
+# select sampleID, time in days, subjectID, and time in months
+df_samples_sub = df_samples %>% 
+  dplyr::select(., sampleid, age_at_collection, diabimmune_sample_id, subjectid, month, abx_ever)
+
+length(df_samples$subjectid)         # number of samples
+length(unique(df_samples$subjectid)) # number of subjects
+
+# Antibiotics
+ab.sampleid = df_samples_sub %>% dplyr::filter(abx_ever == "Antibiotics") %>% dplyr::pull(sampleid)
+ab.rowid = which(rownames(mat_otu_genus_t)  %in% ab.sampleid)
+mat_otu_genus_t_ab = mat_otu_genus_t[ab.rowid,]
+
+# No Antibiotics
+nab.sampleid = df_samples_sub %>% dplyr::filter(abx_ever == "No Antibiotics") %>% dplyr::pull(sampleid)
+nab.rowid = which(rownames(mat_otu_genus_t)  %in% nab.sampleid)
+mat_otu_genus_t_nab = mat_otu_genus_t[nab.rowid,]
+
+# prevalence
+prev.ab = apply(mat_otu_genus_t_ab, 2, function(x){sum(x != 0)/length(x)})
+prev.nab = apply(mat_otu_genus_t_nab, 2, function(x){sum(x != 0)/length(x)})
+
+# taxa to keep per group
+gKeep.ab = which(prev.ab >= 0.10)
+gKeep.nab = which(prev.nab >= 0.10)
+
+# intersection of taxa to keep
+gKeep = dplyr:: intersect(names(gKeep.ab), names(gKeep.nab) )
+
+# otu matrix at 25% prev
+mat_otu_genus_t_ab25 = mat_otu_genus_t_ab %>%
+  dplyr::select(., dplyr::all_of(gKeep))
+
+mat_otu_genus_t_nab25 = mat_otu_genus_t_nab %>%
+  dplyr::select(., dplyr::all_of(gKeep))
+```
+
+# Sparsity
+
+```{r sparse-data, eval=F}
+length(which(mat_otu_genus_t==0))/prod(dim(mat_otu_genus_t))
+
+length(which(mat_otu_genus_t_ab25==0))/prod(dim(mat_otu_genus_t_ab25))
+length(which(mat_otu_genus_t_nab25==0))/prod(dim(mat_otu_genus_t_nab25))
+```
+
+# Normalize
+
+Via Total-Sum Scaling (divide by the total number of reads)
+
+```{r normalize-data}
+g.relAbun25.ab = sweep(mat_otu_genus_t_ab25, 1, rowSums(mat_otu_genus_t_ab25), "/")
+g.relAbun25.nab = sweep(mat_otu_genus_t_nab25, 1, rowSums(mat_otu_genus_t_nab25), "/")
+```
+
+# Merge data
+
+```{r merge-data}
+g.relAbun25.ab.merge = g.relAbun25.ab %>%
+  tibble::rownames_to_column("sampleid") %>%
+  dplyr::inner_join(df_samples_sub,.) %>% as.data.frame()
+
+g.relAbun25.nab.merge = g.relAbun25.nab %>%
+  tibble::rownames_to_column("sampleid") %>%
+  dplyr::inner_join(df_samples_sub,.) %>% as.data.frame()
+```
+
+## Taxon-taxon pairs
+
+Find all possible pairs of taxa
+
+```{r tt-pairs}
+pw.genus = combn(gKeep, 2) # all possible genus-genus pairs 
+rownames(pw.genus) = c("g1", "g2")
+pw.genus = tibble::as_tibble(t(pw.genus))
+```
+
+For each pair data set remove time points with prevalence = 0 (absent at time t)
+
+```{r filter-tp-func}
+filterTP = function(d, x, tp){
+    d.split = split(d, d[,tp])
+    d.split2 = lapply(d.split, function(dd) dd[,which(colnames(dd) %in% x)])
+    prev.ls = lapply(d.split2, function(dd) apply(dd, 2, function(m){sum(m != 0)/length(m)}))
+    prev = do.call("rbind", prev.ls)
+    
+    t.id = which(prev[,1] >= 0.25 & prev[,2] >= 0.25)
+    
+    d.split = d.split[t.id]
+    d = do.call("rbind", d.split)
+    rownames(d) = NULL
+    
+    return(d)
+}
+```
+
+Function to change the "y" in the mu formula for each pair
+
+```{r maginal-formula-func}
+marginFormulaFunc = function(y1, y2, x.mu, x.phi, x.p){
+  
+  # paste "y" "~ x" together to make formula
+  formula.mu = list(as.formula(paste0(y1, paste0(x.mu, collapse = " "))), 
+                    as.formula(paste0(y2, paste0(x.mu, collapse = " "))) )
+  
+  # convert to type=formula
+  formula.phi = list(as.formula(x.phi), as.formula(x.phi) )
+  formula.p   = list(as.formula(x.p), as.formula(x.p))
+  
+  out = tibble::tibble(formula.mu = formula.mu, 
+                       formula.phi = formula.phi, 
+                       formula.p = formula.p)
+  
+  return(out)
+}
+```
+
+# tsMCEM
+
+## Antibiotics
+
+```{r tsMCEM-ab}
+set.seed(390)
+
+# subset data set for each paired relative abundance + time point variable
+pw.assoc.ab = pw.genus %>% 
+    dplyr::mutate(., data = furrr::future_map2(g1, g2, function(x, y, id, tp, df) as.data.frame(df[,c(id, tp, x, y)]), 
+                                               id = "subjectid", tp = "month", df = g.relAbun25.ab.merge, 
+                                               .progress = T, .options = furrr::future_options(seed = T)), 
+                     x = purrr::map2(g1, g2, c) )
+
+# filter time points with prevalence < 25%
+pw.assoc.ab = pw.assoc.ab %>% 
+  dplyr::mutate(., df = furrr::future_map2(data, x, filterTP, tp = "month", 
+                                           .progress = T, .options = furrr::future_options(seed = T)) )
+
+# n time points
+pw.assoc.ab = pw.assoc.ab %>%
+  dplyr::mutate(., t = purrr::map_dbl(df, function(d,tp) length(unique(d[,tp])), tp="month")) %>% # n time point
+  dplyr::filter(., t >= 10) # remove any pair with only < 10 time point
+
+# tsMCEM
+pw.assoc.ab = pw.assoc.ab %>% 
+  dplyr::mutate(., formulas = purrr::map2(g1, g2, marginFormulaFunc, x.mu = ~ 1, x.phi = ~ 1, x.p = ~ 1)) %>% 
+  tidyr::unnest_wider(formulas) %>% 
+  dplyr::mutate(., timepoints = "month", 
+                   AR = "AR0", 
+                   proposal.sd = purrr::map(t, function(x) rep(1, x)), 
+                   niter = 2500, 
+                   emruns = 15) %>% 
+ dplyr::mutate(., tsMCEM = furrr::future_pmap(dplyr::select(., -c(g1,g2,data,t)), twoStageMCEM, 
+                                              init=NULL, ncore = 1, 
+                                              .progress = T, .options = furrr::future_options(seed = T)))
+
+# mcLRT -- manipulate data
+pw.assoc.ab = pw.assoc.ab %>% 
+  tidyr::unnest_wider(tsMCEM) %>% tidyr::unnest_wider(margins1) %>% tidyr::unnest_wider(margins2) %>% # unnest
+  dplyr::mutate(., shape = purrr::map2(shape1, shape2, cbind)) %>%   # single shape variable
+  dplyr::mutate(., shape = purrr::map(shape, function(df) {          # edit shape var colnames
+    df = df[,-which(colnames(df)=="month2")]                         # drop 2nd timepoint (month) var
+    colnames(df)[which(colnames(df)=="month1")] = "month"            # rename timepoint (month) var
+    return(df) }) ) %>% 
+  dplyr::mutate(., thetaNull = 0) %>% # null value
+  dplyr::mutate(., thetaMLE = purrr::map_dbl(mcem, function(x) mean(tail(x$theta,5)) ),  # theta MLE
+                   sigmaMLE = purrr::map_dbl(mcem, function(x) mean(tail(x$sigma,5)) ) ) # sigma MLE
+
+# mcLRT
+pw.assoc.ab = pw.assoc.ab %>% 
+  dplyr::mutate(., mc.LRT = furrr::future_pmap(dplyr::select(., thetaNull,thetaMLE,sigmaMLE,shape,df,x,timepoints,proposal.sd),
+                                               mcLRT,
+                                               init=0, niter=1500, emruns=15, ncore=1, 
+                                               .progress = T, .options = furrr::future_options(seed = T)) )
+```
+
+## No Antibiotics
+
+```{r tsMCEM-nab}
+set.seed(785)
+
+# subset data set for each paired relative abundance + time point variable
+pw.assoc.nab = pw.genus %>% 
+    dplyr::mutate(., data = furrr::future_map2(g1, g2, function(x, y, tp, df) as.data.frame(df[,c(tp, x, y)]), 
+                                               tp = "month", df = g.relAbun25.nab.merge, 
+                                               .progress = T, .options = furrr::future_options(seed = T)), 
+                     x = purrr::map2(g1, g2, c) )
+
+# filter time points with prevalence < 25%
+pw.assoc.nab = pw.assoc.nab %>% 
+  dplyr::mutate(., df = furrr::future_map2(data, x, filterTP, tp = "month", 
+                                           .progress = T, .options = furrr::future_options(seed = T)) )
+
+# n time points
+pw.assoc.nab = pw.assoc.nab %>%
+  dplyr::mutate(., t = purrr::map_dbl(df, function(d,tp) length(unique(d[,tp])), tp="month")) %>% # n time point
+  dplyr::filter(., t >= 10) # remove any pair with only < 3 time point
+
+# tsMCEM
+pw.assoc.nab = pw.assoc.nab %>% 
+  dplyr::mutate(., formulas = purrr::map2(g1, g2, marginFormulaFunc, x.mu = ~ 1, x.phi = ~ 1, x.p = ~ 1)) %>% 
+  tidyr::unnest_wider(formulas) %>% 
+  dplyr::mutate(., x = purrr::map2(g1, g2, c), 
+                   timepoints = "month", 
+                   AR = "AR0", 
+                   proposal.sd = purrr::map(t, function(x) rep(1, x)), 
+                   niter = 2500, 
+                   emruns = 15) %>% 
+ dplyr::mutate(., tsMCEM = furrr::future_pmap(dplyr::select(., -c(g1,g2,data,t)), twoStageMCEM, 
+                                              init=NULL, ncore = 1, 
+                                              .progress = T, .options = furrr::future_options(seed = T)))
+
+# mcLRT -- manipulate data
+pw.assoc.nab = pw.assoc.nab %>% 
+  tidyr::unnest_wider(tsMCEM) %>% tidyr::unnest_wider(margins1) %>% tidyr::unnest_wider(margins2) %>% # unnest
+  dplyr::mutate(., shape = purrr::map2(shape1, shape2, cbind)) %>%   # single shape variable
+  dplyr::mutate(., shape = purrr::map(shape, function(df) {          # edit shape var colnames
+    df = df[,-which(colnames(df)=="month2")]                         # drop 2nd timepoint (month) var
+    colnames(df)[which(colnames(df)=="month1")] = "month"            # rename timepoint (month) var
+    return(df) }) ) %>% 
+  dplyr::mutate(., thetaNull = 0) %>% # null value
+  dplyr::mutate(., thetaMLE = purrr::map_dbl(mcem, function(x) mean(tail(x$theta,5)) ),  # theta MLE
+                   sigmaMLE = purrr::map_dbl(mcem, function(x) mean(tail(x$sigma,5)) ) ) # sigma MLE
+
+# mcLRT
+pw.assoc.nab = pw.assoc.nab %>% 
+  dplyr::mutate(., mc.LRT = furrr::future_pmap(dplyr::select(., thetaNull,thetaMLE,sigmaMLE,shape,df,x,timepoints,proposal.sd),
+                                               mcLRT, 
+                                               init=0, niter=1500, emruns=15, ncore=1, 
+                                               .progress = T, .options = furrr::future_options(seed = T)) )
+```
+
+# FDR control
+
+```{r fdr}
+# Extract LR test statistic
+pw.genus.assoc.ab = pw.genus.assoc.ab %>% 
+  dplyr::mutate(., lr.ts = purrr::map_dbl(mc.LRT, function(x) x$LR.ts ))
+
+pw.genus.assoc.nab = pw.genus.assoc.nab %>%
+  dplyr::mutate(., lr.ts = purrr::map_dbl(mc.LRT, function(x) x$LR.ts ))
+
+# add p- and adjust p- values
+pw.genus.assoc.ab = pw.genus.assoc.ab %>% 
+  dplyr::mutate(., pval = pchisq(lr.ts, 1, lower.tail = F)) %>% 
+  dplyr::mutate(., pval.adj = p.adjust(pval, "BY")) %>% 
+  dplyr::mutate(., adjacency = ifelse(pval.adj <= 0.05, 1, 0))
+
+pw.assoc.subset.ab = pw.genus.assoc.ab %>% 
+  dplyr::select(., g1, g2, thetaMLE,lr.ts, pval, pval.adj, adjacency) %>% 
+  dplyr::left_join(pw.genus, ., by = c("g1" = "g1", "g2" = "g2"))
+
+# pw.assoc.subset.ab %>% 
+#   dplyr::group_by(., g2) %>% 
+#   dplyr::summarise(., n.na = sum(is.na(adjacency))) %>% 
+#   dplyr::arrange(., desc(n.na))
+
+pw.genus.assoc.nab = pw.genus.assoc.nab %>%
+  dplyr::mutate(., pval = pchisq(lr.ts, 1, lower.tail = F)) %>%
+  dplyr::mutate(., pval.adj = p.adjust(pval, "BY")) %>%
+  dplyr::mutate(., adjacency = ifelse(pval.adj <= 0.05, 1, 0))
+
+pw.assoc.subset.nab = pw.genus.assoc.nab %>% 
+  dplyr::select(., g1, g2, thetaMLE,lr.ts, pval, pval.adj, adjacency) %>% 
+  dplyr::left_join(pw.genus, ., by = c("g1" = "g1", "g2" = "g2"))
+
+# significance threshold
+pw.genus.signif.ab = pw.genus.assoc.ab %>%
+  dplyr::filter(., adjacency == 1)
+
+pw.genus.signif.nab = pw.genus.assoc.nab %>%
+  dplyr::filter(., adjacency == 1)
+```
+
+# Adjacency
+
+```{r adj}
+vect2adj = function(values, names){
+  # null matrix
+  adj.temp = matrix(NA, length(names), length(names), dimnames = list(names, names) )
+  
+  adj.temp[lower.tri(adj.temp, diag=F)] = values # lower triangle
+  adj = t(adj.temp)                              # t() to upper triangle
+  adj[lower.tri(adj, diag=F)] = values           # fill lower triangle
+  diag(adj) = 0                                  # no closed loops (for unweighted matrix)
+  
+  return(adj)
+}
+
+adjacency.ab = vect2adj(pw.assoc.subset.ab$adjacency, gKeep)
+adjacency.nab = vect2adj(pw.assoc.subset.nab$adjacency, gKeep)
+
+# plot adjacency matrix
+g.ab = igraph::graph.adjacency(adjacency.ab, mode="undirected")
+plot(g.ab)
+
+g.nab = igraph::graph.adjacency(adjacency.nab, mode="undirected")
+plot(g.nab)
+
+# heatmap +  dendrogram
+# pheatmap::pheatmap(adjacency.ab, color = c("white", "black"), na_col = "grey", cluster_cols = F, cluster_rows = F)
+# pheatmap::pheatmap(adjacency.nab, color = c("white", "black"), na_col = "grey", cluster_cols = F, cluster_rows = F)
+
+# pheatmap::pheatmap(adjacency.ab, color = c("white", "black"), cutree_rows = 1, legend = F, fontsize = 5, na_col = "grey")
+# pheatmap::pheatmap(adjacency.nab, color = c("white", "black"), cutree_rows = 1, legend = F, fontsize = 5)
+```
+
+# Graph cluster
+
+```{r graph-clust}
+# greedy community algorithm
+fc.ab = igraph::fastgreedy.community(igraph::as.undirected(g.ab))
+table(igraph::membership(fc.ab))
+igraph::V(g.ab)$color = ifelse(igraph::membership(fc.ab)==1, "red",
+                                ifelse(igraph::membership(fc.ab)==2, "orange", 
+                                       ifelse(igraph::membership(fc.ab)==3, "green", 
+                                              ifelse(igraph::membership(fc.ab)==4, "blue", 
+                                                     ifelse(igraph::membership(fc.ab)==5, "purple", "grey") ) ) ) )
+plot(g.ab)
+
+fc.nab = igraph::fastgreedy.community(igraph::as.undirected(g.nab))
+table(igraph::membership(fc.nab))
+igraph::V(g.nab)$color = ifelse(igraph::membership(fc.nab)==1, "red",
+                                ifelse(igraph::membership(fc.nab)==2, "orange", 
+                                       ifelse(igraph::membership(fc.nab)==3, "green", 
+                                              ifelse(igraph::membership(fc.nab)==4, "blue", 
+                                                     ifelse(igraph::membership(fc.nab)==5, "purple", "grey") ) ) ) )
+plot(g.nab)
+```
+
+```{r randIndex}
+fossil::adj.rand.index(igraph::membership(fc.ab), igraph::membership(fc.nab) )
+
+set.seed(59)
+randIndexPerm = lapply(1:1000, function(i){
+  fossil::adj.rand.index(igraph::membership(fc.ab), igraph::membership(fc.nab)[sample(igraph::membership(fc.nab))] )
+})
+
+mean(unlist(randIndexPerm))
+sd(unlist(randIndexPerm))
+```
+
+# Newtork Graph
+
+```{r nework-graph-ab}
+nodes.ab = dplyr::full_join(                                                   # form nodes from unique taxa
+  pw.assoc.subset.ab %>% dplyr::distinct(g1) %>% dplyr::rename(genus=g1),      # from g1
+  pw.assoc.subset.ab %>% dplyr::distinct(g2) %>% dplyr::rename(genus=g2) ) %>% # and g2
+  dplyr::inner_join(., enframe(igraph::membership(fc.ab), name = "genus", value = "cluster")) %>% # join with cluster assign
+  dplyr::mutate(., cluster = as.numeric(cluster)) %>%                     # make cluster numeric
+  dplyr::mutate(., cluster = ifelse(cluster <= 5, cluster, "No Cluster") ) %>% 
+  tibble::rowid_to_column("id")                                           # and give nodes number id
+
+edges.ab = pw.genus.signif.ab %>% dplyr::select(., g1, g2, thetaMLE) %>% 
+  dplyr::left_join(., nodes.ab, by = c("g1"="genus")) %>% dplyr::rename(g1.id=id) %>% # replace g1 taxa with unique id
+  dplyr::left_join(., nodes.ab, by = c("g2"="genus")) %>% dplyr::rename(g2.id=id) %>% # replace g2 taxa with unique id
+  dplyr::mutate(., depSign = factor(sign(thetaMLE), levels = c(-1,1)) ) %>%           # sign of dependence param
+  dplyr::select(g1.id, g2.id, thetaMLE, depSign)
+
+# title case nodes -- must do have joining edges and nodes in above code
+nodes.ab = nodes.ab %>% dplyr::mutate(., genus=tools::toTitleCase(gsub("_", " ", genus)))
+
+# make routes object for plotting
+routes.ab <- tidygraph::tbl_graph(nodes = nodes.ab, edges = edges.ab, directed = FALSE)
+
+# network graph
+# palette = http://mr.schochastics.net/netVizR.html
+networkGraph.ab = ggraph::ggraph(routes.ab, layout = "nicely") + 
+  ggraph::geom_edge_fan(aes(color = depSign), show.legend=F) + 
+  ggraph::scale_edge_colour_brewer(palette = "Set2") + 
+  ggraph::geom_node_point(aes(shape=cluster, color=cluster), size = 2) + 
+  ggraph::geom_node_text(aes(label = genus),size=2, repel=TRUE) + # label nodes
+  ggraph::theme_graph()
+
+# ggsave(filename = here:::here("output/longitudinal/04_diabimmuneRDA/20220321_diabimmuneNetwork-ab.png"),
+#        networkGraph.ab)
+```
+
+```{r nework-graph-nab}
+nodes.nab = dplyr::full_join(                                                   # form nodes from unique taxa
+  pw.assoc.subset.nab %>% dplyr::distinct(g1) %>% dplyr::rename(genus=g1),      # from g1
+  pw.assoc.subset.nab %>% dplyr::distinct(g2) %>% dplyr::rename(genus=g2) ) %>% # and g2
+  dplyr::inner_join(., enframe(igraph::membership(fc.nab), name = "genus", value = "cluster")) %>% # join with cluster assign
+  dplyr::mutate(., cluster = as.numeric(cluster)) %>%                     # make cluster numeric
+  dplyr::mutate(., cluster = ifelse(cluster <= 5, cluster, "No Cluster") ) %>% 
+  tibble::rowid_to_column("id")                                           # and give nodes number id
+
+edges.nab = pw.genus.signif.nab %>% dplyr::select(., g1, g2, thetaMLE) %>% 
+  dplyr::left_join(., nodes.nab, by = c("g1"="genus")) %>% dplyr::rename(g1.id=id) %>% # replace g1 taxa with unique id
+  dplyr::left_join(., nodes.nab, by = c("g2"="genus")) %>% dplyr::rename(g2.id=id) %>% # replace g2 taxa with unique id
+  dplyr::mutate(., depSign = factor(sign(thetaMLE), levels = c(-1,1)) ) %>%           # sign of dependence param
+  dplyr::select(g1.id, g2.id, thetaMLE, depSign)
+
+# title case nodes -- must do have joining edges and nodes in above code
+nodes.nab = nodes.nab %>% dplyr::mutate(., genus=tools::toTitleCase(gsub("_", " ", genus)))
+
+# make routes object for plotting
+routes.nab <- tidygraph::tbl_graph(nodes = nodes.nab, edges = edges.nab, directed = FALSE)
+
+# network graph
+# palette = http://mr.schochastics.net/netVizR.html
+networkGraph.nab = ggraph::ggraph(routes.nab, layout = "nicely") + 
+  ggraph::geom_edge_fan(aes(color = depSign), show.legend=F) + 
+  ggraph::scale_edge_colour_brewer(palette = "Set2") + 
+  ggraph::geom_node_point(aes(shape=cluster, color=cluster), size = 2) +
+  ggraph::geom_node_text(aes(label = genus),size=2, repel=TRUE) + # label nodes
+  ggraph::theme_graph()
+
+# ggsave(filename = here:::here("output/longitudinal/04_diabimmuneRDA/20220321_diabimmuneNetwork-nab.png"),
+#        networkGraph.nab)
+```
+
+## Combine plots
+
+```{r combNetworks}
+networkGraphComb = cowplot::plot_grid(networkGraph.ab, networkGraph.nab, nrow = 2, 
+                                      labels = c('Antibiotics', 'No Antibiotics'))
+
+# ggsave(filename = here:::here("output/longitudinal/04_diabimmuneRDA/20211118_diabimmune-networkGraphComb.tiff"),
+#        networkGraphComb)
+```
+
+```{r commonEdges}
+commonEdges = intersect(paste0(pw.genus.signif.ab$g1, "-", pw.genus.signif.ab$g2), 
+                        paste0(pw.genus.signif.nab$g1, "-", pw.genus.signif.nab$g2) )
+length(commonEdges)
+```
+
+<!-- https://cs.hse.ru/data/2015/05/28/1096850826/6._Graph_Patterns_and_Vizualization.pdf -->
+
+```{r motifs, eval = F}
+motif3.ab = igraph::graph.motifs(g.ab, 3)
+motif3.nab = igraph::graph.motifs(g.nab, 3)
+motif3.tbl = matrix(data = c(motif3.ab, motif3.nab), nrow=2, byrow = T, dimnames = list(c("ab", "nab"), 1:4) )
+motif3.tbl = motif3.tbl[,!colSums(!is.finite(motif3.tbl))]
+sweep(motif3.tbl, 1, rowSums(motif3.tbl), FUN = "/")
+chisq.test(motif3.tbl)
+
+reshape2::melt(motif3.tbl) %>% 
+  dplyr::rename(network=Var1, motif=Var2, count=value) %>% 
+  dplyr::mutate(motif= as.factor(motif)) %>% 
+  ggplot2::ggplot(., aes(x=motif, y=count, color=network)) + ggplot2::geom_point() + ggplot2::theme_bw()
+
+motif4.ab = igraph::graph.motifs(g.ab, 4)
+motif4.nab = igraph::graph.motifs(g.nab, 4)
+motif4.tbl = matrix(data = c(motif4.ab, motif4.nab), nrow=2, byrow = T, dimnames = list(c("ab", "nab"), 1:11) )
+motif4.tbl = motif4.tbl[,!colSums(!is.finite(motif4.tbl))]
+sweep(motif4.tbl, 1, rowSums(motif4.tbl), FUN = "/")
+chisq.test(motif4.tbl)
+
+reshape2::melt(motif4.tbl) %>% 
+  dplyr::rename(network=Var1, motif=Var2, count=value) %>% 
+  dplyr::mutate(motif= as.factor(motif)) %>% 
+  ggplot2::ggplot(., aes(x=motif, y=count, color=network)) + ggplot2::geom_point() + ggplot2::theme_bw()
+```
+
+# Node & network properties
+
+```{r node-properties}
+# degree
+degree.ab = igraph::degree(g.ab, mode="all")
+hist(degree.ab)
+mean(degree.ab); sd(degree.ab)
+
+degree.nab = igraph::degree(g.nab, mode="all")
+hist(degree.nab)
+mean(degree.nab); sd(degree.nab)
+
+ks.test(degree.ab, degree.nab)
+
+
+# degree normalized
+degree.norm.ab = igraph::degree(g.ab, mode="all", normalized=T)
+hist(degree.norm.ab)
+mean(degree.norm.ab); sd(degree.norm.ab)
+
+degree.norm.nab = igraph::degree(g.nab, mode="all", normalized=T)
+hist(degree.norm.nab)
+mean(degree.norm.nab); sd(degree.norm.nab)
+
+ks.test(degree.norm.ab, degree.norm.nab)
+
+
+# closeness
+closeness.ab = igraph::closeness(g.ab, normalized=T)
+hist(closeness.ab)
+mean(closeness.ab); sd(closeness.ab)
+
+closeness.nab = igraph::closeness(g.nab, normalized=T)
+hist(closeness.nab)
+mean(closeness.nab); sd(closeness.nab)
+
+ks.test(closeness.ab, closeness.nab)
+
+
+# betweenness
+betweenness.ab = igraph::betweenness(g.ab, normalized=T)
+hist(betweenness.ab)
+mean(betweenness.ab); sd(betweenness.ab)
+
+betweenness.nab = igraph::betweenness(g.nab, normalized=T)
+hist(betweenness.nab)
+mean(betweenness.nab); sd(betweenness.nab)
+
+ks.test(betweenness.ab, betweenness.nab)
+
+
+# eigenvector centrality
+ec.ab = igraph::eigen_centrality(g.ab)$vector
+hist(ec.ab)
+mean(ec.ab); sd(ec.ab)
+
+ec.nab = igraph::eigen_centrality(g.nab)$vector
+hist(ec.nab)
+mean(ec.nab); sd(ec.nab)
+
+ks.test(ec.ab, ec.nab)
+```
+
+```{r network-properties}
+igraph::diameter(g.ab, directed=FALSE, weights=NA)
+igraph::get_diameter(g.ab, directed=FALSE, weights=NA)
+
+igraph::diameter(g.nab, directed=FALSE, weights=NA)
+igraph::get_diameter(g.nab, directed=FALSE, weights=NA)
+
+igraph::mean_distance(g.ab, directed=FALSE)
+igraph::mean_distance(g.nab, directed=FALSE)
+
+dist.ab = igraph::distances(g.ab)
+dist.nab = igraph::distances(g.nab)
+
+(density.ab = igraph::edge_density(g.ab))
+(density.nab = igraph::edge_density(g.nab))
+
+(cc.ab = igraph::transitivity(g.ab))
+(cc.nab = igraph::transitivity(g.nab))
+
+(mod.ab = igraph::modularity(g.ab, igraph::membership(fc.ab)))
+(mod.nab = igraph::modularity(g.nab, igraph::membership(fc.nab)))
+```
+
+## Centrality plots
+
+```{r centrality-plots}
+degree.dist.ab = data.frame(degree=0:max(degree.ab), 
+                            Fdegree=1-igraph::degree.distribution(g.ab,cumulative=T, mode="all"), 
+                            id=rep("ab",max(degree.ab)+1))
+
+degree.dist.nab = data.frame(degree=0:max(degree.nab), 
+                            Fdegree=1-igraph::degree.distribution(g.nab,cumulative=T, mode="all"), 
+                            id=rep("nab",max(degree.nab)+1))
+
+degree.dist = dplyr::bind_rows(list(degree.dist.ab,degree.dist.nab)) 
+
+plotDegreeDist = degree.dist %>% 
+  ggplot2::ggplot(., aes(x = degree, y=Fdegree, color = id)) + 
+  ggplot2::geom_line(aes(x = degree, y = Fdegree)) +
+  ggplot2::xlab("Degree") + ggplot2::ylab("Degree Distribution") + ggplot2::theme_bw()
+
+# ggplot2::ggsave(filename = here::here("output/longitudinal/04_diabimmuneRDA/20211118_plotDegreeDist.png"), plotDegreeDist)
+
+plotCentrality = function(x, y, title){
+  axis.lim = max(c(x,y)) + 0.02
+  
+  dplyr::inner_join(tibble::enframe(x, name = "genus", "Antibiotics"),
+                    tibble::enframe(y, name = "genus", "No Antibiotics") ) %>% 
+    ggplot2::ggplot(., aes(x=Antibiotics, y=`No Antibiotics`,label=genus)) + ggplot2::geom_point(size=1) + 
+    ggplot2::geom_text(aes(label=genus), size=3, hjust=0, vjust=1, check_overlap = T) +
+    ggplot2::geom_abline(slope = 1, intercept = 0, color = "red") + ggplot2::ggtitle(title) + 
+    ggplot2::ylim(0, axis.lim) + ggplot2::xlim(0, axis.lim) + 
+    ggplot2::theme_bw() + ggplot2::theme(plot.title = element_text(hjust = 0.5))
+}
+
+plotDegree = plotCentrality(degree.norm.ab, degree.norm.nab, "Degree") + ggplot2::ggtitle("Degree")
+# ggplot2::ggsave(filename = here::here("output/longitudinal/04_diabimmuneRDA/20220321_plotDegree.png"), plotDegree)
+
+plotCloseness = plotCentrality(closeness.ab, closeness.nab, "Closeness")
+# ggplot2::ggsave(filename = here::here("output/longitudinal/04_diabimmuneRDA/20220321_plotCloseness.png"), plotCloseness)
+
+plotBetweenness = plotCentrality(betweenness.ab, betweenness.nab, "Betweenness")
+# ggplot2::ggsave(filename = here::here("output/longitudinal/04_diabimmuneRDA/20220321_plotBetweenness.png"), plotBetweenness)
+
+plotCentralityComb = cowplot::plot_grid(plotDegree, 
+                                        plotCloseness, 
+                                        plotBetweenness,
+                                        nrow=1)
+
+# ggplot2::ggsave(filename = here::here("output/longitudinal/04_diabimmuneRDA/20211118_plotCentralityComb.tiff"), plotCentralityComb)
+
+plotTheta = dplyr::inner_join(pw.genus.signif.ab %>% dplyr::select(., g1, g2, thetaMLE) %>% dplyr::rename(Antibiotics = thetaMLE), 
+                  pw.genus.signif.nab %>% dplyr::select(., g1, g2, thetaMLE) %>% dplyr::rename(`No Antibiotics` = thetaMLE) ) %>% 
+  dplyr::mutate(., genus = paste0(g1, "-", g2)) %>% 
+  ggplot2::ggplot(., aes(x=Antibiotics, y=`No Antibiotics`,label=genus)) + ggplot2::geom_point(size=1) + 
+  ggplot2::geom_text(aes(label=genus), size=2, hjust=0, vjust=1, check_overlap = T) +
+  ggplot2::geom_abline(slope = 1, intercept = 0, color = "red") + ggplot2::ggtitle(expression(hat(theta))) + 
+  ggplot2::ylim(-4.5,5.5) + ggplot2::xlim(-4.5,5.5) + 
+  ggplot2::theme_bw() + ggplot2::theme(plot.title = element_text(hjust = 0.5))
+
+# ggplot2::ggsave(filename = here::here("output/longitudinal/04_diabimmuneRDA/20211118_plotTheta.png"), plotTheta)
+```
+
+## Fragility Percolation
+
+```{r fragility}
+fragility = function(adj, degree, attack="targeted"){
+  if(attack=="targeted"){
+    rm.node.sort = sort(degree, decreasing = T)
+  } else if(attack=="random"){
+    rm.node.sort = sample(x = degree, size = length(degree), replace = F)
+  } else {
+    stop("ERROR: attack method must either be 'targeted' or 'random'.")
+  }
+  
+  out = vector("list", length = length(rm.node.sort)-1)
+  
+  for (i in seq_along(out)) {
+    taxon.drop = names(rm.node.sort[i])
+    if(i==1){
+      taxon.drop.id = which(rownames(adj) == taxon.drop)     # location of taxon to drop
+      
+      adj.rm = adj[-taxon.drop.id,-taxon.drop.id]            # drop taxon
+      g.rm = igraph::graph.adjacency(adj, mode="undirected") # new graph
+    } else{
+      taxon.drop.id = which(rownames(adj.rm) == taxon.drop)     # location of taxon to drop
+      
+      adj.rm = adj.rm[-taxon.drop.id,-taxon.drop.id]            # drop taxon
+      g.rm = igraph::graph.adjacency(adj.rm, mode="undirected") # new graph
+    }
+    
+    fc.rm = igraph::fastgreedy.community(igraph::as.undirected(g.rm))
+    
+    out[[i]] = c(
+      diameter     = igraph::diameter(g.rm), 
+      meanDistance = igraph::mean_distance(g.rm), 
+      edgeDensity  = igraph::edge_density(g.rm), 
+      cc           = igraph::transitivity(g.rm), 
+      nCluster     = length(fc.rm), 
+      modularity   = igraph::modularity(g.rm, igraph::membership(fc.rm)), 
+      efficiency   = brainGraph::efficiency(g.rm, "global")
+    )
+  }
+  
+  out = do.call("rbind", out)
+  
+  out.df = data.frame(nodeRM = 1:nrow(out), out)
+  
+  return(out.df)
+}
+
+fragility.target.ab = fragility(adjacency.ab, degree.ab, "targeted")
+fragility.target.nab = fragility(adjacency.nab, degree.nab, "targeted")
+
+set.seed(63)
+fragility.random.ab = fragility(adjacency.ab, degree.ab, "random")
+fragility.random.nab = fragility(adjacency.nab, degree.nab, "random")
+
+
+fragility.target = dplyr::bind_rows(fragility.target.ab, fragility.target.nab, .id = "id") %>% 
+  dplyr::mutate(., id = ifelse(id == 1, "Antibiotics", "No Antibiotics"))
+
+fragility.random = dplyr::bind_rows(fragility.random.ab, fragility.random.nab, .id = "id") %>% 
+  dplyr::mutate(., id = ifelse(id == 1, "Antibiotics", "No Antibiotics"))
+
+# fragility.target %>% 
+#   dplyr::filter(., !is.na(efficiency) & efficiency > 0) %>% 
+#   lm(log(efficiency) ~ nodeRM*id, data = .) %>% summary()
+# 
+# fragility.target %>% 
+#   dplyr::filter(., !is.na(efficiency) & efficiency > 0, id == "No Antibiotics") %>% 
+#   lm(log(efficiency) ~ nodeRM, data = .) %>% summary()
+# 
+# fragility.target %>% 
+#   dplyr::filter(., !is.na(efficiency) & efficiency > 0, id == "Antibiotics") %>% 
+#   lm(log(efficiency) ~ nodeRM, data = .) %>% summary()
+
+
+fragility.target.diameterPlot = fragility.target %>% 
+  ggplot2::ggplot(., aes(x = nodeRM, y = diameter, color = id)) + 
+  ggplot2::geom_point() + ggplot2::geom_line() + ggplot2::theme_bw() + 
+  ggplot2::xlab("Number of Nodes Removed") + ggplot2::ylab("Diameter") + ggplot2::ggtitle("") + 
+  ggplot2::theme(legend.title = element_blank(), legend.position = "bottom")
+
+# ggplot2::ggsave(filename = here::here("output/longitudinal/04_diabimmuneRDA/20220321_fragility-target-diameter.png"), 
+#                 plot = fragility.target.diameterPlot)
+
+fragility.target.efficiencyPlot = fragility.target %>% 
+  dplyr::filter(., !is.nan(efficiency)) %>% 
+  ggplot2::ggplot(., aes(x = nodeRM, y = efficiency, color = id)) + 
+  ggplot2::geom_point() + ggplot2::geom_line() + ggplot2::theme_bw() + 
+  ggplot2::xlab("Number of Nodes Removed") + ggplot2::ylab("Efficiency") + ggplot2::ggtitle("") + 
+  ggplot2::theme(legend.title = element_blank(), legend.position = "bottom")
+
+fragility.random.diameterPlot = fragility.random %>% 
+  ggplot2::ggplot(., aes(x = nodeRM, y = diameter, color = id)) + 
+  ggplot2::geom_point() + ggplot2::geom_line() + ggplot2::theme_bw() + 
+  ggplot2::xlab("Number of Nodes Removed") + ggplot2::ylab("Diameter") + ggplot2::ggtitle("") + 
+  ggplot2::theme(legend.title = element_blank(), legend.position = "bottom")
+
+fragility.random.efficiencyPlot = fragility.random %>% 
+  ggplot2::ggplot(., aes(x = nodeRM, y = efficiency, color = id)) + 
+  ggplot2::geom_point() + ggplot2::geom_line() + ggplot2::theme_bw() + 
+  ggplot2::xlab("Number of Nodes Removed") + ggplot2::ylab("Efficiency") + ggplot2::ggtitle("") + 
+  ggplot2::theme(legend.title = element_blank(), legend.position = "bottom")
+
+# ggplot2::ggsave(filename = here::here("output/longitudinal/04_diabimmuneRDA/20220321_fragility-random-efficiency.png"),
+#                 plot = fragility.random.efficiencyPlot)
+
+fragilityPlots = cowplot::plot_grid(fragility.target.diameterPlot + ggplot2::theme(legend.position = "none"), 
+                                    # fragility.target.efficiencyPlot + ggplot2::theme(legend.position = "none"),
+                                    # fragility.random.diameterPlot + ggplot2::theme(legend.position = "none"),
+                                    fragility.random.efficiencyPlot + ggplot2::theme(legend.position = "none"), 
+                                    labels = c("Targeted", "Random") )
+
+# extract a legend that is laid out horizontally
+# frorm here https://wilkelab.org/cowplot/articles/shared_legends.html
+legend = cowplot::get_legend(fragility.target.diameterPlot)
+
+fragilityPlots.legend = cowplot::plot_grid(fragilityPlots, legend, ncol = 1, rel_heights = c(1, .1))
+
+# ggplot2::ggsave(filename = here::here("output/longitudinal/04_diabimmuneRDA/20211130_fragilityPlots.tiff"), plot = fragilityPlots.legend)
+
+
+# fragility.target %>% 
+#   ggplot2::ggplot(., aes(x = nodeRM, y = edgeDensity, color = id)) + 
+#   ggplot2::geom_point() + ggplot2::geom_line() + ggplot2::theme_bw()
+# 
+# fragility.target %>% 
+#   ggplot2::ggplot(., aes(x = nodeRM, y = cc, color = id)) + 
+#   ggplot2::geom_point() + ggplot2::geom_line() + ggplot2::theme_bw()
+# 
+# fragility.target %>% 
+#   ggplot2::ggplot(., aes(x = nodeRM, y = nCluster, color = id)) + 
+#   ggplot2::geom_point() + ggplot2::geom_line() + ggplot2::theme_bw()
+# 
+# fragility.target %>% 
+#   ggplot2::ggplot(., aes(x = nodeRM, y = modularity, color = id)) + 
+#   ggplot2::geom_point() + ggplot2::geom_line() + ggplot2::theme_bw()
+```
+
+# Posterior Mean plots
+
+```{r mean-posterior}
+set.seed(28)
+emPosteriorMean = function(theta.t.ls){
+  out = purrr::map(theta.t.ls, function(x) purrr::map_dbl(x, mean)) %>%      # calculate the mean of each sampled theta(t)_r
+    purrr::map(., tibble::enframe, name = "t", value = "postMeanThetaT") %>% # tibble for each t
+    dplyr::bind_rows(., .id = "r")                                           # bind list into 1 tibble
+  
+  out = out %>% 
+    dplyr::mutate(., t = factor(t, levels = unique(out$t)), 
+                     r = as.numeric(r)) 
+  
+  return(out)
+}
+
+pw.genus.signif.ab = pw.genus.signif.ab %>% 
+  dplyr::mutate(., theta.t = purrr::map(mcem, function(x) x$theta.t) ) %>% 
+  dplyr::mutate(., theta.t.t = purrr::map2(theta.t,df, function(x,y){
+    times = unique(y$month)
+    out=lapply(x, function(xx, t) {names(xx) = t; return(xx)}, t = times)
+    return(out) }) ) %>% 
+  dplyr::mutate(., pmThetaT.r = purrr::map(theta.t.t, emPosteriorMean)) # mean theta(t)_r
+
+pmThetaT.ab = purrr::map(pw.genus.signif.ab$pmThetaT.r,
+                           function(x){
+                             x %>% 
+                               dplyr::filter(., r %in% tail(unique(x$r),5)) %>%     # select last 5 theta(t)_r
+                               dplyr::group_by(., t) %>%                            # for each t
+                               dplyr::summarise(., pmThetaT = mean(postMeanThetaT)) # take their average
+                             }) %>% 
+  dplyr::bind_rows(., .id = "id") %>% 
+  dplyr::mutate(., t = as.numeric(t)) %>% 
+  dplyr::filter(., id %in% sample(1:length(pw.genus.signif.ab), size = 10, replace = F) ) %>%
+  ggplot2::ggplot(., aes(x = t, y = pmThetaT, group = id, color = id)) + 
+  ggplot2::geom_point() + ggplot2::geom_line() +
+  ggplot2::ylab(expression(hat(~"E[")~theta^(t)~"| X]")) + ggplot2::ggtitle("") + 
+  ggplot2::theme_bw() + ggplot2::theme(plot.title = element_text(hjust = 0.5), legend.position="none")
+
+
+# ggplot2::ggsave(filename = here::here("output/longitudinal/04_diabimmuneRDA/20211117_meanThetaT-ab.png"), plot = pmThetaT.ab)
+
+pw.genus.signif.nab = pw.genus.signif.nab %>% 
+  dplyr::mutate(., theta.t = purrr::map(mcem, function(x) x$theta.t )) %>% 
+  dplyr::mutate(., theta.t.t = purrr::map2(theta.t,df, function(x,y){
+    times = unique(y$month)
+    out=lapply(x, function(xx, t) {names(xx) = t; return(xx)}, t = times)
+    return(out) }) ) %>% 
+  dplyr::mutate(., pmThetaT.r = purrr::map(theta.t.t, emPosteriorMean)) # mean theta(t)_r
+
+pmThetaT.nab = purrr::map(pw.genus.signif.nab$pmThetaT.r,
+                            function(x){
+                              x %>% 
+                                dplyr::filter(., r %in% tail(unique(x$r),5)) %>%     # select last 5 theta(t)_r
+                                dplyr::group_by(., t) %>%                            # for each t
+                                dplyr::summarise(., pmThetaT = mean(postMeanThetaT)) # take their average
+                              }) %>% 
+  dplyr::bind_rows(., .id = "id") %>% 
+  dplyr::mutate(., t = as.numeric(t)) %>% 
+  dplyr::filter(., id %in% sample(1:length(pw.genus.signif.nab), size = 10, replace = F) ) %>%
+  ggplot2::ggplot(., aes(x = t, y = pmThetaT, group = id, color = id)) + 
+  ggplot2::geom_point() + ggplot2::geom_line() +
+  ggplot2::ylab(expression(hat(~"E[")~theta^(t)~"| X]")) + ggplot2::ggtitle("") + 
+  ggplot2::theme_bw() + ggplot2::theme(plot.title = element_text(hjust = 0.5), legend.position="none")
+
+# ggplot2::ggsave(filename = here::here("output/longitudinal/04_diabimmuneRDA/20211117_meanThetaT-nab.png"), plot = pmThetaT.nab)
+
+pmThetaTComb = cowplot::plot_grid(pmThetaT.ab, pmThetaT.nab, nrow = 2, labels = c('Antibiotics', 'No Antibiotics'))
+
+# ggsave(filename = here:::here("output/longitudinal/04_diabimmuneRDA/20211118_diabimmune-pmThetaTPlotComb.tiff"), pmThetaTComb)
+```
+
+```{r posterior,eval=F}
+pm.plots.ab = purrr::map(pw.genus.signif.ab$pmThetaT, function(x){
+  x %>% 
+    ggplot2::ggplot(., aes(x = r, y = postMeanThetaT, group = t, color = t)) + 
+    ggplot2::geom_point() + 
+    ggplot2::geom_line() + ggplot2::theme_bw() })
+
+# pdf(here::here("output/longitudinal/04_diabimmuneRDA/20210924_posteriorMean-thetaT-ab.pdf"))
+# print(pm.plots.ab)
+# dev.off()
+
+pm.plots.nab = purrr::map(pw.genus.signif.nab$pmThetaT, function(x){
+  x %>% 
+    ggplot2::ggplot(., aes(x = r, y = postMeanThetaT, group = t, color = t)) + 
+    ggplot2::geom_point() + 
+    ggplot2::geom_line() + ggplot2::theme_bw() })
+
+# pdf(here::here("output/longitudinal/04_diabimmuneRDA/20210924_posteriorMean-thetaT-nab.pdf"))
+# print(pm.plots.nab)
+# dev.off()
+```
+

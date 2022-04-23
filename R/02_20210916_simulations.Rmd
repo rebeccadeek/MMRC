@@ -1,0 +1,379 @@
+---
+title: "Simulations"
+author: "Rebecca Deek"
+date: "09/16/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+
+# Read Data
+## Setting 1
+simData.0p5s=readRDS(here::here("R/20210916-simData-ar0-thetap5-sigma-s.RDS"))
+theta.mcem.0p5s=readRDS(here::here("R/20210916-tsmcem-ar0-thetap5-sigma-s.RDS"))
+
+## Setting 2
+simData.04s=readRDS(here::here("R/20210916-simData-ar0-theta4-sigma-s.RDS"))
+theta.mcem.04s=readRDS(here::here("R/20210916-tsmcem-ar0-theta4-sigma-s.RDS"))
+
+## Setting 3
+simData.04l=readRDS(here::here("R/20210916-simData-ar0-theta4-sigma-l.RDS"))
+theta.mcem.04l=readRDS(here::here("R/20210916-tsmcem-ar0-theta4-sigma-l.RDS"))
+
+## Setting 4
+simData.n3l=readRDS(here::here("R/20210916-simData-ar1-thetan3-sigma-l.RDS"))
+theta.mcem.n3l=readRDS(here::here("R/20210916-tsmcem-ar1-thetan3-sigma-l.RDS"))
+```
+
+# Plot functions
+
+```{r functions}
+# Functions
+plotMCEM = function(data.ls, truth, yaxis){
+  if(yaxis=="theta"){
+    dat = purrr::map(seq_along(data.ls), function(i) data.ls[[i]]$mcem$theta) %>% 
+      purrr::map_df(., tibble::enframe, name = "index", .id = 'id')
+  } else if(yaxis=="sigma"){
+    dat = purrr::map(seq_along(data.ls), function(i) data.ls[[i]]$mcem$sigma) %>% 
+      purrr::map_df(., tibble::enframe, name = "index", .id = 'id')
+  } else {
+    stop("ERROR: yaxis must be either 'theta' or 'sigma'.")
+  }
+  
+  dat %>% 
+    ggplot2::ggplot(., aes(x=index, y=value, color=id)) + 
+    ggplot2::geom_line() + 
+    ggplot2::geom_hline(yintercept=truth, color="black", linetype="dashed") + 
+    ggplot2::labs(x="", y="") +
+    # ggplot2::labs(x="Iteration", y=yaxis) + 
+    ggplot2::labs(color='Simulation') + 
+    ggplot2::theme_bw() + 
+    ggplot2::theme(legend.title=element_text(size=8))
+}
+
+mcemEst = function(mcem){
+  theta = mean(tail(mcem$theta, 5))
+  sigma = mean(tail(mcem$sigma, 5))
+  
+  return(c(theta=theta, sigma=sigma))
+}
+```
+
+# MCEM estimates
+
+```{r mcemEsts}
+# MCEM estimates (simulation/row)
+mcemEst.0p5s = purrr::map_df(seq_along(theta.mcem.0p5s), function(i) mcemEst(theta.mcem.0p5s[[i]]$mcem) ) %>% 
+  dplyr::mutate(., trueTheta = 0.5, trueSigma = 0.5, 
+                trueLab = factor(paste0("theta==", 0.5, "~ ~sigma==", 0.5)) )
+
+mcemEst.04s = purrr::map_df(seq_along(theta.mcem.04s), function(i) mcemEst(theta.mcem.04s[[i]]$mcem) ) %>% 
+  dplyr::mutate(., trueTheta = 4, trueSigma = 0.5, 
+                trueLab = factor(paste0("theta==", 4, "~ ~sigma==", 0.5)) )
+
+mcemEst.04l = purrr::map_df(seq_along(theta.mcem.04l), function(i) mcemEst(theta.mcem.04l[[i]]$mcem) ) %>% 
+  dplyr::mutate(., trueTheta = 4, trueSigma = 1.3, 
+                trueLab = factor(paste0("theta==", 4, "~ ~sigma==", 1.3)) )
+
+mcemEst.n3l = purrr::map_df(seq_along(theta.mcem.n3l), function(i) mcemEst(theta.mcem.n3l[[i]]$mcem) ) %>%
+  dplyr::mutate(., trueTheta = -3, trueSigma = 1,
+                trueLab = factor(paste0("theta==", -3, "~ ~sigma==", 1)) )
+
+# Average estimates across all estimates (consistency)
+apply(mcemEst.0p5s[,1:2], 2, mean)
+apply(mcemEst.04s[,1:2], 2, mean)
+apply(mcemEst.04l[,1:2], 2, mean)
+apply(mcemEst.n3l[,1:2], 2, mean)
+
+mcemEst.all = dplyr::bind_rows(mcemEst.0p5s, mcemEst.04s, mcemEst.04l, mcemEst.n3l)
+```
+
+## Boxplots
+
+```{r bp}
+# boxplot x labels
+xlabels=c(
+  "theta==0.5~ ~sigma==0.5" = expression(theta==0.5~","~sigma==0.5),
+  "theta==4~ ~sigma==0.5"   = expression(theta==4~","~sigma==0.5),
+  "theta==4~ ~sigma==1.3"   = expression(theta==4~","~sigma==1.3),
+  "theta==-3~ ~sigma==1"    = expression(theta==-3~","~sigma==1) )
+
+# Boxplot of MCEM estimates (all runs)
+thetaBP = mcemEst.all %>% 
+  ggplot2::ggplot(., aes(y = theta, x = as.factor(trueLab)) ) + 
+  ggplot2::geom_boxplot(outlier.alpha = 0) + 
+  ggbeeswarm::geom_quasirandom(dodge.width=0.75) + 
+  ggplot2::stat_summary(fun = mean, geom = "errorbar", aes(ymax = ..y.., ymin = ..y..), 
+                        width = .75, linetype = "dashed") + 
+  ggplot2::stat_summary(aes(y = trueTheta, x = as.factor(trueLab) ), fun = "mean", 
+                        geom = "point", shape = 8,size = 2, color = "red") + 
+  ggplot2::ylab(expression(hat(theta))) + ggplot2::xlab("") + 
+  ggplot2::scale_x_discrete(labels=xlabels) + 
+  ggplot2::theme_bw()
+
+# ggplot2::ggsave(filename = here::here("output/longitudinal/02_simulation/20220119_simThetaBP.png"), thetaBP)
+
+sigmaBP = mcemEst.all %>% 
+  ggplot2::ggplot(., aes(y = sigma, x = as.factor(trueLab)) ) + 
+  ggplot2::geom_boxplot(outlier.alpha = 0) + 
+  ggbeeswarm::geom_quasirandom(dodge.width=0.75) + 
+  ggplot2::stat_summary(fun = mean, geom = "errorbar", aes(ymax = ..y.., ymin = ..y..), 
+                        width = .75, linetype = "dashed") + 
+  ggplot2::stat_summary(aes(y = trueSigma, x = as.factor(trueLab)), fun = "mean", 
+                        geom = "point", shape = 8,size = 2, color = "red") + 
+  ggplot2::ylab(expression(hat(sigma))) + ggplot2::xlab("") + 
+  ggplot2::scale_x_discrete(labels=xlabels) + 
+  ggplot2::theme_bw()
+
+# ggplot2::ggsave(filename = here::here("output/longitudinal/02_simulation/20220119_simSigmaBP.png"), sigmaBP)
+
+combBP = cowplot::plot_grid(thetaBP, sigmaBP, nrow = 2)
+
+# ggplot2::ggsave(filename = here::here("output/longitudinal/02_simulation/20220119_simCombBP.png"), combBP)
+```
+
+## Traceplots
+
+```{r traceplots}
+# Plots of EM estimates/iteration
+## setting 1
+ggtheta.0p5s = plotMCEM(theta.mcem.0p5s, 0.5, "theta")
+ggsigma.0p5s = plotMCEM(theta.mcem.0p5s, 0.5, "sigma")
+
+## setting 2
+ggtheta.04s = plotMCEM(theta.mcem.04s, 4, "theta")
+ggsigma.04s = plotMCEM(theta.mcem.04s, 0.5, "sigma")
+
+## setting 3
+ggtheta.04l = plotMCEM(theta.mcem.04l, 4, "theta")
+ggsigma.04l = plotMCEM(theta.mcem.04l, 1.3, "sigma")
+
+
+# setting 4
+ggtheta.n3l = plotMCEM(theta.mcem.n3l, -3, "theta")
+ggsigma.n3l = plotMCEM(theta.mcem.n3l, 1, "sigma")
+```
+
+Combine individual trace plots into one.
+
+```{r comb-traceplots}
+# Plot together
+# Shared axis title 
+# https://stackoverflow.com/questions/61988741/how-to-create-a-common-title-in-x-and-y-axis-in-an-arrange-of-plots-using-ggdra
+combTheta = cowplot::plot_grid(ggtheta.0p5s + ggplot2::theme(legend.position="none"), 
+                               ggtheta.04s + ggplot2::theme(legend.position="none"),
+                               ggtheta.04l + ggplot2::theme(legend.position="none"), 
+                               ggtheta.n3l + ggplot2::theme(legend.position="none"),
+                               ncol = 1, labels = c("A","B","C","D")) + 
+  ggplot2::theme(plot.margin = margin(0, 0, -20, 15))                         # add padding for y-label
+combTheta = cowplot::add_sub(combTheta, expression(theta), 0, 13, angle = 90) # add common y-label
+combTheta = cowplot::ggdraw(combTheta)                                        # print plot with added sub
+
+# ggplot2::ggsave(filename = here::here("output/longitudinal/02_simulation/20220119_simThetaTrace.png"), combTheta)
+
+
+combSigma = cowplot::plot_grid(ggsigma.0p5s + ggplot2::theme(legend.position="none"), 
+                               ggsigma.04s + ggplot2::theme(legend.position="none"),
+                               ggsigma.04l + ggplot2::theme(legend.position="none"), 
+                               ggsigma.n3l + ggplot2::theme(legend.position="none"),
+                               ncol = 1) + 
+  ggplot2::theme(plot.margin = margin(0, 0, -20, 15))                           # add padding for y-label
+combSigma = cowplot::add_sub(combSigma, expression(sigma), 0, 12.5, angle = 90) # add common y-label
+combSigma = cowplot::ggdraw(combSigma)                                          # print plot with added sub
+
+# ggplot2::ggsave(filename = here::here("output/longitudinal/02_simulation/20220119_simSigmaTrace.png"), combSigma)
+
+
+# extract legend
+legend <- cowplot::get_legend(
+  # create some space to the left of the legend
+  ggtheta.04l + theme(legend.box.margin = margin(0, 0, 0, 12))
+)
+
+# combAll = cowplot::plot_grid(combTheta, combSigma, legend, nrow=1, rel_widths = c(1,1,.25))
+combAll = cowplot::plot_grid(combTheta, combSigma, nrow=1)
+
+# ggplot2::ggsave(filename = here::here("output/longitudinal/02_simulation/20220119_simCombTrace.png"), combAll)
+```
+
+# Theta-t
+
+Mean of the true theta-t values from simulation
+
+```{r true-theta-t}
+# True theta_t
+theta.t.est = function(mcem){
+  mean = mean(unique(mcem$theta.t))
+  sd = sd(unique(mcem$theta.t))
+  
+  return(c(mean=mean, sd=sd))
+}
+
+apply(purrr::map_df(seq_along(simData.0p5s), function(i) theta.t.est(simData.0p5s[[i]]) ), 2, mean)
+apply(purrr::map_df(seq_along(simData.04s), function(i) theta.t.est(simData.04s[[i]]) ), 2, mean)
+apply(purrr::map_df(seq_along(simData.04l), function(i) theta.t.est(simData.04l[[i]]) ),2, mean)
+apply(purrr::map_df(seq_along(simData.n3l), function(i) theta.t.est(simData.n3l[[i]]) ), 2, mean)
+```
+
+
+# Null simulation
+
+```{r read-null-data}
+# Read Data
+## Setting 1
+simNull.ar0.s=readRDS(here::here("R/20211217_simData-ar0-theta0-sigma-s.RDS"))
+
+## Setting 2
+simNull.ar0.l=readRDS(here::here("R/20211217_simData-ar0-theta0-sigma-l.RDS"))
+
+## Setting 3
+simNull.ar1.l=readRDS(here::here("R/20211217_simData-ar1-thetan0-sigma-l.RDS"))
+```
+
+```{r null-mcemEsts}
+# MCEM estimates (simulation/row)
+simNull.ar0.s = simNull.ar0.s %>% 
+  dplyr::mutate(., trueTheta = 0, trueSigma = 0.5, 
+                trueLab = factor(paste0("theta==", 0, "~ ~sigma==", 0.5)) )
+
+simNull.ar0.l = simNull.ar0.l %>% 
+  dplyr::mutate(., trueTheta = 0, trueSigma = 1.3, 
+                trueLab = factor(paste0("theta==", 0, "~ ~sigma==", 1.3)) )
+
+simNull.ar1.l = simNull.ar1.l %>%
+  dplyr::mutate(., trueTheta = 0, trueSigma = 1,
+                trueLab = factor(paste0("theta==", 0, "~ ~sigma==", 1)) )
+
+simNull.all = dplyr::bind_rows(simNull.ar0.s, simNull.ar0.l, simNull.ar1.l)
+```
+
+```{r null-bp}
+# boxplot x labels
+null.xlabels=c(
+  "theta==0~ ~sigma==0.5" = expression(theta==0~","~sigma==0.5),
+  "theta==0~ ~sigma==1.3" = expression(theta==0~","~sigma==1.3), 
+  "theta==0~ ~sigma==1"   = expression(theta==0~","~sigma==1) )
+
+thetaNullBP = simNull.all %>% 
+  ggplot2::ggplot(., aes(y = thetaMLE, x = as.factor(trueLab)) ) + 
+  ggplot2::geom_boxplot(outlier.alpha = 0) + 
+  ggbeeswarm::geom_quasirandom(dodge.width=0.75) + 
+  ggplot2::stat_summary(fun = mean, geom = "errorbar", aes(ymax = ..y.., ymin = ..y..), 
+                        width = .75, linetype = "dashed") + 
+  ggplot2::stat_summary(aes(y = trueTheta, x = as.factor(trueLab) ), fun = "mean", 
+                        geom = "point", shape = 8,size = 2, color = "red") + 
+  ggplot2::ylab(expression(hat(theta))) + ggplot2::xlab("") + 
+  ggplot2::scale_x_discrete(labels=null.xlabels) +
+  ggplot2::theme_bw()
+
+sigmaNullBP = simNull.all %>% 
+  ggplot2::ggplot(., aes(y = sigmaMLE, x = as.factor(trueLab)) ) + 
+  ggplot2::geom_boxplot(outlier.alpha = 0) + 
+  ggbeeswarm::geom_quasirandom(dodge.width=0.75) + 
+  ggplot2::stat_summary(fun = mean, geom = "errorbar", aes(ymax = ..y.., ymin = ..y..), 
+                        width = .75, linetype = "dashed") + 
+  ggplot2::stat_summary(aes(y = trueSigma, x = as.factor(trueLab)), fun = "mean", 
+                        geom = "point", shape = 8,size = 2, color = "red") + 
+  ggplot2::ylab(expression(hat(sigma))) + ggplot2::xlab("") + 
+  ggplot2::scale_x_discrete(labels=null.xlabels) +
+  ggplot2::theme_bw()
+
+combNullBP = cowplot::plot_grid(thetaNullBP, sigmaNullBP, nrow = 2)
+
+# ggplot2::ggsave(filename = here::here("output/longitudinal/02_simulation/20220119_nullSimCombBP.png"), combNullBP)
+```
+
+```{r}
+mcemEst.altnull = dplyr::bind_rows(mcemEst.all, 
+                                   simNull.all %>% 
+                                     dplyr::select(.,thetaMLE, sigmaMLE,trueTheta,trueSigma,trueLab) %>% 
+                                     dplyr::rename(., theta=thetaMLE, sigma=sigmaMLE))
+
+# boxplot x labels
+altnull.xlabels=c(
+  "theta==0.5~ ~sigma==0.5" = expression(theta==0.5~","~sigma==0.5), 
+  "theta==4~ ~sigma==0.5"   = expression(theta==4~","~sigma==0.5), 
+  "theta==4~ ~sigma==1.3"   = expression(theta==4~","~sigma==1.3), 
+  "theta==-3~ ~sigma==1"    = expression(theta==-3~","~sigma==1), 
+  "theta==0~ ~sigma==0.5" = expression(theta==0~","~sigma==0.5), 
+  "theta==0~ ~sigma==1.3" = expression(theta==0~","~sigma==1.3), 
+  "theta==0~ ~sigma==1" = expression(theta==0~","~sigma==1) )
+
+thetaAltNullBP = mcemEst.altnull %>% 
+  ggplot2::ggplot(., aes(y = theta, x = as.factor(trueLab)) ) + 
+  ggplot2::geom_boxplot(outlier.alpha = 0) + 
+  ggbeeswarm::geom_quasirandom(dodge.width=0.75, alpha=0.2) + 
+  ggplot2::stat_summary(fun = mean, geom = "errorbar", aes(ymax = ..y.., ymin = ..y..), 
+                        width = .75, linetype = "dashed") + 
+  ggplot2::stat_summary(aes(y = trueTheta, x = as.factor(trueLab) ), fun = "mean", 
+                        geom = "point", shape = 8,size = 2, color = "red") + 
+  ggplot2::ylab(expression(tilde(theta))) + ggplot2::xlab("") + 
+  ggplot2::scale_x_discrete(labels=altnull.xlabels) +
+  ggplot2::theme_bw()
+
+sigmaAltNullBP = mcemEst.altnull %>% 
+  ggplot2::ggplot(., aes(y = sigma, x = as.factor(trueLab)) ) + 
+  ggplot2::geom_boxplot(outlier.alpha = 0) + 
+  ggbeeswarm::geom_quasirandom(dodge.width=0.75, alpha=0.2) + 
+  ggplot2::stat_summary(fun = mean, geom = "errorbar", aes(ymax = ..y.., ymin = ..y..), 
+                        width = .75, linetype = "dashed") + 
+  ggplot2::stat_summary(aes(y = trueSigma, x = as.factor(trueLab)), fun = "mean", 
+                        geom = "point", shape = 8,size = 2, color = "red") + 
+  ggplot2::ylab(expression(tilde(sigma))) + ggplot2::xlab("") + 
+  ggplot2::scale_x_discrete(labels=altnull.xlabels) +
+  ggplot2::theme_bw()
+
+combAltNullBP = cowplot::plot_grid(thetaAltNullBP, sigmaAltNullBP, nrow = 2)
+
+# ggplot2::ggsave(filename = here::here("output/longitudinal/02_simulation/20220119_altNullSimCombBP.tiff"), combAltNullBP)
+
+```
+
+```{r null-traceplot}
+plotNullMCEM = function(data.ls, truth, yaxis){
+  if(yaxis=="theta"){
+    dat = purrr::map(seq_along(data.ls), function(i) data.ls[[i]]$theta) %>% 
+      purrr::map_df(., tibble::enframe, name = "index", .id = 'id')
+  } else if(yaxis=="sigma"){
+    dat = purrr::map(seq_along(data.ls), function(i) data.ls[[i]]$sigma) %>% 
+      purrr::map_df(., tibble::enframe, name = "index", .id = 'id')
+  } else {
+    stop("ERROR: yaxis must be either 'theta' or 'sigma'.")
+  }
+  
+  dat %>% 
+    ggplot2::ggplot(., aes(x=index, y=value, color=id)) + 
+    ggplot2::geom_line() + 
+    ggplot2::geom_hline(yintercept=truth, color="black", linetype="dashed") + 
+    ggplot2::labs(x="", y="") +
+    # ggplot2::labs(x="Iteration", y=yaxis) + 
+    ggplot2::labs(color='Simulation') + 
+    ggplot2::theme_bw() + 
+    ggplot2::theme(legend.title=element_text(size=8))
+}
+
+# Plots of EM estimates/iteration
+ggtheta.ar0.s = plotNullMCEM(simNull.ar0.s$mcem, 0, "theta")
+ggsigma.ar0.s = plotNullMCEM(simNull.ar0.s$mcem, 0.5, "sigma")
+
+ggtheta.ar0.l = plotNullMCEM(simNull.ar0.l$mcem, 0, "theta")
+ggsigma.ar0.l = plotNullMCEM(simNull.ar0.l$mcem, 1.3, "sigma")
+
+ggtheta.ar1.l = plotNullMCEM(simNull.ar1.l$mcem, 0, "theta")
+ggsigma.ar1.l = plotNullMCEM(simNull.ar1.l$mcem, 1, "sigma")
+```
+
+```{r t1e}
+lr.ts.ar0.s = unlist(lapply(simNull.ar0.s$mc.LRT, function(x) x[["LR.ts"]]))
+length(which(lr.ts.ar0.s > qchisq(0.95,1)))/length(lr.ts.ar0.s)
+
+lr.ts.ar0.l = unlist(lapply(simNull.ar0.l$mc.LRT, function(x) x[["LR.ts"]]))
+length(which(lr.ts.ar0.l > qchisq(0.95,1)))/length(lr.ts.ar0.l)
+
+lr.ts.ar1.l = unlist(lapply(simNull.ar1.l$mc.LRT, function(x) x[["LR.ts"]]))
+length(which(lr.ts.ar1.l > qchisq(0.95,1)))/length(lr.ts.ar1.l)
+```
+
